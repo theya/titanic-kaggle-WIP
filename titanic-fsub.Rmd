@@ -1,0 +1,467 @@
+---
+title: "Titanic"
+author: "Molina Rafidison"
+date: "12 May 2016"
+output: 
+    html_document:
+        keep_md: yes
+---
+
+# Introduction
+
+## Context
+
+### Introduction
+
+This analysis aims to identify what sorts of people were likely to survive thanks to the records availaible on Kaggle website. I will apply the tools of machine learning to predict which passengers survived the tragedy.
+As my first subimission on Kaggle, I focused on the features engineering and the data analysis. 
+
+## Preliminaries
+
+### Reproducibility
+
+Set the following seed to make sure the analysis is reproducible.
+
+```{r}
+seed <- 201605
+```
+
+### Packages
+
+First install and load the needed packages.
+
+```{r packages, echo = FALSE, message = FALSE}
+packages <- c("ggplot2", "caret", "data.table", "dplyr", "Hmisc")
+sapply(packages, require, character.only = TRUE, quietly = TRUE)
+```
+
+### Getting and reading data
+
+Download [the Internet-based file from Kaggle website](https://www.kaggle.com/c/titanic/data) to have them locally. Some more information about the variables are also available at this link. 
+Once loaded, read data.
+
+```{r}
+path <- getwd()
+
+train <- read.csv(file.path(path, "data/train.csv"), na.strings = c("NA","#DIV/0!",""))
+test <- read.csv(file.path(path, "data/test.csv"), na.strings = c("NA","#DIV/0!",""))
+```
+
+
+# Cleaning data
+
+## Engineering features
+
+In order to look into the data, we join both datasets `train` and `test` to apply the exact same transformations. 
+
+```{r, message = FALSE}
+data <- bind_rows(train, test)
+str(data)
+```
+
+I will take the variable one-by-one to and see what we can do with them to get even better data.
+
+### Titles in the names
+
+Looking into the titles available in the passenger name can be interesting when compared to the `Passenger class`. Let's split out the titles from the names.
+
+```{r}
+data$Title <- gsub("(.*, )|(\\..*)", "", data$Name)
+table(data$Pclass, data$Title)
+```
+
+Some titles are equivalent but spelled in a different way. Let's clean them up.
+
+```{r}
+pattern <- c("Capt", "Col", "Don", "Dona", "Jonkheer", "Lady", "Major",
+             "Mlle", "Mme", "Ms", "Sir", "the Countess")
+replacement <- c("Other", "Other", "Mr", "Mrs", "Other", "Other", "Other",
+             "Miss", "Mrs", "Miss", "Other", "Other")
+
+for (i in 1:length(pattern)) {data$Title[data$Title == pattern[i]] <- replacement[i]}
+```
+
+I put the other titles in a single category names `Other` as they only represent `round(18/1309*100)` of the total observations. I then avoid the bias.
+
+```{r}
+ggplot(data[1:891, ], aes(x = Title, fill = factor(Survived))) +
+    geom_bar(stat = "count", position = "dodge") +
+    labs(x = "Title")
+```
+
+### Gathering family members
+
+The information about the family relationship gives enough details to know how big is each family. I must start with creating a `Surname` variable and a `familySize` variable for the family size.
+
+```{r}
+data$Surname <- gsub("(, .*)", "", data$Name)
+data$familySize <- 1 + data$SibSp + data$Parch
+```
+
+Now let's see how families survived according to the number of members.
+
+```{r}
+ggplot(data[1:891, ], aes(x = familySize, fill = factor(Survived))) +
+    geom_bar(stat = "count", position = "dodge") +
+    labs(x = "Family Size")
+```
+
+The families that counts between 2 and 4 members have more chances to survive. The single individual are more likely to die.
+I split the families into three levels in a new variable `familyType`.
+
+```{r}
+data$familyType[data$familySize == 1] <- "Single"
+data$familyType[data$familySize %in% c(2, 3, 4)] <- "Small"
+data$familyType[data$familySize > 4] <- "Big"
+
+table(data$Pclass, data$familyType)
+```
+
+### Checking tickets
+
+Some tickets have additional information containing letters. I transform the `Ticket` variable to only have the number and create a new variable `addInfo` with the additional information.
+
+```{r}
+data$addInfo <- gsub("( .*)|(^[0-9]+$)", "", data$Ticket)
+data$Ticket <- gsub("(.* )|(^[a-zA-Z]$)", "", data$Ticket)
+
+## Transfor Ticket into a integer vector
+data$Ticket <- as.integer(data$Ticket)
+```
+
+We have a total of `length(unique(data$Ticket))` out of the `nrow(data)`, meaning that `length(unique(data$Ticket)) / nrow(data) * 100`% of the observations are related tickets. Let's look at this in further details.
+Quick peek at the `Ticket` variable.
+
+```{r, message = FALSE}
+qplot(factor(Pclass), Fare, data = data, geom = "boxplot")
+```
+
+Mmm... Curious thing. Some fares look excessive.
+
+```{r}
+ticketFare <- data %>% group_by(Ticket, Fare) %>% tally()
+names(ticketFare)[3] <- "nbTicket"
+```
+
+Investigating this case shows that the more tickets carrying the same number, the more expensive. That means that we have to compute the individual cost by dividing the fare by the number of tickets with the same number.
+
+```{r}
+ticketFare$rightFare <- round(ticketFare$Fare / ticketFare$nbTicket, 4)
+
+## Add this variable to the original dataset
+data <- inner_join(data, ticketFare)
+qplot(factor(Pclass), rightFare, data = data, geom = "boxplot")
+```
+
+But there are still many outliers in Fare, particularly in the first class. Why that?
+
+### Mining cabins
+
+We want to gather all the cabins that are associated to a ticket. 
+
+```{r}
+ticketCabin <- aggregate(Cabin ~ Ticket, 
+                         function(x) {
+                             sort <- unlist(unique(strsplit(paste(x), " ")))
+                             paste(sort, collapse = " ")
+                         },
+                         data = data)
+
+names(ticketCabin)[2] <- "allCabin"
+```
+
+This gives the information about the number of cabin(s) booked by a group of passengers carrying the same ticket reference.
+
+```{r}
+ticketCabin$nbCabin <- sapply(ticketCabin$allCabin, function(x) {
+        list <- strsplit(x, " ")
+        length(list[[1]])
+})
+```
+
+Joint both datasets based on the ticket reference.
+
+```{r}
+data <- left_join(data, ticketCabin)
+
+qplot(factor(nbCabin), rightFare, data = data, geom = "boxplot")
+```
+
+There are still many missing values regarding cabins. Let's take care of this point before going any further.
+
+
+## Imputing missing values
+
+Let's proceed in the order of the number of missing values.
+
+```{r}
+summary(data)
+```
+
+### Fulling fare
+
+The summary shows that there is only one fare record missing. 
+
+```{r}
+data[is.na(data$Fare), ]
+```
+
+It is a single man in third class who embarked in Southampton. 
+
+```{r}
+misFare <- data %>% filter(Embarked == "S", Pclass == 3, familyType == "Single")
+
+ggplot(misFare, aes(x = rightFare)) +
+  geom_density(fill = '#99d6ff', alpha=0.4) + 
+  geom_vline(aes(xintercept=median(rightFare, na.rm=T)), colour='red', linetype='dashed', lwd=1)
+```
+
+I impute the median of the group that has the same features as this passenger, replacing the missing value.
+
+```{r}
+data$Fare[1044] <- median(misFare$rightFare, na.rm = TRUE)
+data$rightFare[1044] <- median(misFare$rightFare, na.rm = TRUE)
+```
+
+### Taking care of embarkment
+
+The summary also shows that two massengers have unknown city embarkment. 
+
+```{r}
+data[is.na(data$Embarked), ]
+```
+
+Both of these women have the same ticket reference. They share the same cabin.
+
+```{r}
+misEmbarked <- data %>% filter(Pclass == 1, familyType == "Single") %>% na.omit()
+
+ggplot(misEmbarked, aes(x = Embarked, y = rightFare)) +
+    geom_boxplot(aes(fill = Sex)) +
+    geom_hline(aes(yintercept=40), colour='red', linetype='dashed', lwd=1)
+```
+
+Both women are more likely to embark at Cherbourg than Southampton. 
+
+```{r}
+## They embarked at Southampton
+data$Embarked[c(62, 830)] <- "C"
+```
+
+### Giving tickets
+
+Four passengers do not have any ticket reference. 
+
+```{r}
+data[is.na(data$Ticket), ]
+```
+
+Surprisingly, they have a free third class ticket and an additional information on their ticket: "LINE". Given these information, I will pretend that they share the same cabin.
+
+```{r}
+data$Cabin[c(180, 272, 303, 598)] <- "LINE"
+data$allCabin[c(180, 272, 303, 598)] <- "LINE"
+data$nbCabin[c(180, 272, 303, 598)] <- 1
+```
+
+And I will give the ticket a reference that could not have been used. The ticket numbers should start from number 1 so I will take 0 as the number.
+
+```{r}
+data$Ticket[c(180, 272, 303, 598)] <- 0
+data$nbTicket[c(180, 272, 303, 598)] <- 4
+```
+
+### Growing the age tree
+
+And now, the `Age` variable. There are `sum(is.na(data$AGe))` missing values. I am going to use the `Hmisc` package to impute the missing values.
+
+```{r}
+simpleData <- data %>% select(Pclass, Sex, Age, Embarked, Title, familySize, familyType, rightFare)
+
+set.seed(seed)
+
+library(Hmisc)
+ageHmisc <- aregImpute(~ Age + Title + Sex + Embarked + familyType + Pclass + rightFare, x = TRUE, data = simpleData, n.impute = 10, nk = 0)
+impHmisc <- as.data.frame(ageHmisc$x)
+
+par(mfrow=c(1,2))
+hist(data$Age, freq=T, main='Age: Original Data', col='navyblue')
+hist(impHmisc$Age, freq=T, main='Age: Hmisc Output', col='steelblue')
+
+summary(data$Age)
+summary(impHmisc$Age)
+
+data$Age <- impHmisc$Age
+```
+
+### Parenting family members
+
+Now that we have all ages, we can identify the potential children.
+
+```{r}
+child <- data %>% filter(Age < 21, Parch > 0, Title != "Mrs")
+
+data$familyMember <- 0
+data$familyMember[which(data$PassengerId %in% child$PassengerId)] <- 1
+```
+
+And the potential mothers and fathers.
+
+```{r}
+mother <- data %>% filter(Sex == "female", Age >= 18, Parch > 0, Title != "Miss", familyMember != 1)
+father <- data %>% filter(Sex == "male", Age >= 18, Parch > 0)
+
+data$familyMember[which(data$PassengerId %in% mother$PassengerId)] <- 2
+data$familyMember[which(data$PassengerId %in% father$PassengerId)] <- 3
+```
+
+We need to group by `Surname` and keep the families respecting the conditions to have at least one child and one mother.
+
+```{r}
+maxChildAge <- data %>%
+    filter(familyMember == 1) %>%
+    group_by(Surname) %>%
+    summarise(maxChildAge = max(Age))
+
+data <- left_join(data, maxChildAge)
+data$familyMember[which(!data$Surname %in% maxChildAge$Surname)] <- 0
+
+parents <- data %>%
+    group_by(Surname) %>%
+    filter(familyMember == 2 | familyMember == 3, Age > maxChildAge + 15)
+
+data$familyMember[which(!data$Surname %in% parents$Surname)] <- 0
+```
+
+### Assigning cabins
+
+We saw that `sum(is.na(data$Cabin))/length(data$Cabin)` observations were missing in the `Cabin` variable. I started to fill in some of them thanks to the information we had.
+Now we need to use the same method to impute the missing values but only to find the number of cabins each ticket number booked.
+
+```{r}
+data$nbCabin <- as.integer(data$nbCabin)
+largerData <- data %>% select(Pclass, Sex, Age, Surname, familyMember, Ticket, Embarked, Title, familySize, familyType, rightFare, nbCabin)
+
+cabHmisc <- aregImpute(~ nbCabin + Pclass + Sex + Age + familyMember + Embarked + familyType + rightFare, x = TRUE, data = largerData, n.impute = 10, nk = 0)
+impCabHmisc <- as.data.frame(cabHmisc$x)
+data$nbCabin <- impCabHmisc$nbCabin
+
+par(mfrow = c(1,2))
+plot(data$nbCabin, data$rightFare)
+plot(impCabHmisc$nbCabin, largerData$rightFare)
+
+summary(data$nbCabin)
+summary(impCabHmisc$nbCabin)
+```
+
+Divide the final fare again by the number of estimated cabin.
+
+```{r}
+data$rightFare <- data$rightFare / data$nbCabin
+```
+
+### Final cleaning
+
+The final cleaning consists in keeping the right variables to build the model.
+
+```{r}
+data <- data %>%
+    select(PassengerId, 
+           Survived, 
+           Pclass, 
+           Sex, 
+           Age, 
+           Ticket, 
+           Title, 
+           rightFare)
+```
+
+
+## Model building
+
+We want to predict the categorical outcome `Survived` and the data is labeled, meaning we focus on a classification method. 
+
+### Splitting training and testing sets
+
+Let's make sure all the atomic classes are valid.
+
+```{r}
+str(data)
+data <- as.data.frame(data)
+data$Survived <- factor(data$Survived, levels = c(0,1), labels = c("Died", "Survived"))
+data$Pclass <- factor(data$Pclass, labels = c("First", "Second", "Third"))
+data$Title <- factor(data$Title, labels = c("Dr", "Master", "Miss", "Mr", "Mrs", "Other", "Rev"))
+```
+
+Now that we are done with the transformations, I split the dataset into two smaller ones. These respect the original split.
+
+```{r}
+train <- data[1:891, -c(1, 2)]
+trainLabel <- data[1:891, 2]
+
+test <- data[892:1309, -2]
+testLabel <- data[892:1309, 2]
+```
+
+### Cross-validation parameters
+
+Define the settings to train our model based on a k-fold cross-validation method over 10 folds repeated twice.
+
+```{r}
+tControl <- trainControl(method = "repeatedcv", 
+                         number = 10, 
+                         repeats = 2,
+                         search = "grid")
+rfGrid <- expand.grid(.mtry = 2)
+```
+
+### Random Forest
+
+I have added two tuning parameters to the Random Forest algorithm: `mtry`and `ntree`. This choice is the restult of a random training. We train our model using the `caret` package.
+
+```{r}
+set.seed(seed)
+rfModel <- train(x = train,
+             y = trainLabel,
+             method = "rf",
+             trControl = tControl,
+             tuneLength = 20,
+             ntree = 1000,
+             tuneGrid = rfGrid)
+## Accuracy of 84%
+```
+
+These are the results based on the training set.
+
+```{r}
+print(rfModel)
+```
+
+### Predictions
+
+Call the predictions for on the testing set.
+
+```{r}
+rfModelPred <- predict.train(rfModel, newdata = test)
+```
+
+### Variable importance
+
+Look at the most influential variables.
+
+```{r, echo = FALSE}
+varImportance <- varImp(rfModel)
+
+dotPlot(varImportance, top = 6)
+```
+
+Write the csv file that will be submitted.
+
+```{r}
+rfModelPred <- factor(rfModelPred, labels = c(0, 1))
+
+submission <- data.frame(PassengerId = test$PassengerId, Survived = rfModelPred)
+write.csv(submission, file = 'titanic-rf.csv', row.names = F)
+```
+
+Public score: 0.77
